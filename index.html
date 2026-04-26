@@ -488,10 +488,50 @@ const DEFAULTS = {
 };
 
 // ============================================================
-// STATE — load from localStorage or use defaults
+// STATE — localStorage للنصوص + IndexedDB للصور
 // ============================================================
-const STORE_KEY = 'ziyad_portfolio_v2';
+const STORE_KEY = 'ziyad_portfolio_v3';
 let S = loadState();
+
+// IndexedDB للصور
+let imgDB = null;
+function openImgDB(){
+  return new Promise((resolve)=>{
+    if(imgDB){ resolve(imgDB); return; }
+    const req = indexedDB.open('ziyad_imgs', 1);
+    req.onupgradeneeded = e => e.target.result.createObjectStore('imgs');
+    req.onsuccess = e => { imgDB = e.target.result; resolve(imgDB); };
+    req.onerror = () => resolve(null);
+  });
+}
+async function saveImg(key, dataUrl){
+  const db = await openImgDB();
+  if(!db) return;
+  return new Promise(resolve=>{
+    const tx = db.transaction('imgs','readwrite');
+    tx.objectStore('imgs').put(dataUrl, key);
+    tx.oncomplete = ()=>resolve();
+    tx.onerror = ()=>resolve();
+  });
+}
+async function loadImg(key){
+  const db = await openImgDB();
+  if(!db) return null;
+  return new Promise(resolve=>{
+    const req = db.transaction('imgs','readonly').objectStore('imgs').get(key);
+    req.onsuccess = ()=>resolve(req.result||null);
+    req.onerror = ()=>resolve(null);
+  });
+}
+async function deleteImg(key){
+  const db = await openImgDB();
+  if(!db) return;
+  return new Promise(resolve=>{
+    const tx = db.transaction('imgs','readwrite');
+    tx.objectStore('imgs').delete(key);
+    tx.oncomplete = ()=>resolve();
+  });
+}
 
 function loadState(){
   try {
@@ -500,7 +540,30 @@ function loadState(){
   } catch(e){}
   return JSON.parse(JSON.stringify(DEFAULTS));
 }
-function saveState(){ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }
+
+function saveState(){
+  // احفظ بدون الصور (img) في localStorage
+  const toSave = JSON.parse(JSON.stringify(S));
+  toSave.ideas.forEach(idea=>{ delete idea.img; });
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(toSave));
+  } catch(e){
+    // لو امتلأ، احذف القديم وحاول مجدداً
+    localStorage.removeItem(STORE_KEY);
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(toSave)); } catch(e2){}
+  }
+}
+
+// تحميل الصور من IndexedDB وحقنها في S.ideas
+async function loadAllImgs(){
+  for(let i=0;i<S.ideas.length;i++){
+    const img = await loadImg('idea_'+i);
+    if(img) S.ideas[i].img = img;
+  }
+  renderIdeas();
+}
+// استدعاء بعد تحميل الصفحة
+openImgDB().then(()=>loadAllImgs());
 
 // Admin password (change this!)
 const ADMIN_PASS = 'ziyad2025';
@@ -767,7 +830,7 @@ function saveIdentity(){
   S.identity.pageTitle = document.getElementById('cf-pagetitle').value;
   S.identity.phone = document.getElementById('cf-phone').value;
   S.identity.email = document.getElementById('cf-email').value;
-  saveState(); applyIdentityDOM(); alert('✅ تم الحفظ!');
+  saveState(); applyIdentityDOM(); showToast('✅ تم الحفظ!');
 }
 function resetIdentity(){ S.identity=JSON.parse(JSON.stringify(DEFAULTS.identity)); saveState(); populateAdminFields(); applyIdentityDOM(); }
 
@@ -777,11 +840,11 @@ function saveStats(){
   S.stats.views = document.getElementById('cf-views').value;
   S.stats.extraNum = document.getElementById('cf-stat3-num').value;
   S.stats.extraLbl = document.getElementById('cf-stat3-lbl').value;
-  saveState(); applyStatsDOM(); alert('✅ تم الحفظ!');
+  saveState(); applyStatsDOM(); showToast('✅ تم الحفظ!');
 }
 
 // SAVE COLORS
-function saveColors(){ saveState(); alert('✅ تم حفظ الألوان!'); }
+function saveColors(){ saveState(); showToast('✅ تم حفظ الألوان!'); }
 function resetColors(){
   S.colors=JSON.parse(JSON.stringify(DEFAULTS.colors));
   saveState(); applyColorsDOM(); populateAdminFields();
@@ -817,7 +880,7 @@ function renderIdeasEditor(){
             📁 ارفع صورة من جهازك
             <input type="file" accept="image/*" style="display:none;" onchange="uploadIdeaImg(${i},this)" />
           </label>
-          ${idea.img ? `<div style="display:flex;align-items:center;gap:0.5rem;"><img src="${idea.img}" style="width:50px;height:70px;object-fit:cover;border-radius:6px;border:1px solid rgba(245,200,66,0.3);"><button onclick="S.ideas[${i}].img='';renderIdeasEditor()" style="background:transparent;border:none;color:#f88;cursor:pointer;font-size:1rem;">✕</button></div>` : '<span style="color:var(--gray);font-size:0.78rem;">لا توجد صورة — سيظهر الإيموجي</span>'}
+          ${idea.img ? `<div style="display:flex;align-items:center;gap:0.5rem;"><img src="${idea.img}" style="width:50px;height:70px;object-fit:cover;border-radius:6px;border:1px solid rgba(245,200,66,0.3);"><button onclick="deleteIdeaImg(${i})" style="background:transparent;border:none;color:#f88;cursor:pointer;font-size:1rem;">✕ حذف الصورة</button></div>` : '<span style="color:var(--gray);font-size:0.78rem;">لا توجد صورة — سيظهر الإيموجي</span>'}
         </div>
       </div>
       <div class="a-field"><label class="a-label">إيموجي (يظهر لو ما في صورة)</label><input class="a-input" value="${idea.emoji||'🎬'}" oninput="S.ideas[${i}].emoji=this.value" /></div>
@@ -829,12 +892,51 @@ function renderIdeasEditor(){
 function uploadIdeaImg(i, input){
   const file = input.files[0];
   if(!file) return;
+  // ضغط الصورة قبل الحفظ
   const reader = new FileReader();
   reader.onload = e => {
-    S.ideas[i].img = e.target.result;
-    renderIdeasEditor();
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      const maxW = 600, maxH = 900;
+      let w = img.width, h = img.height;
+      if(w > maxW){ h = h*(maxW/w); w = maxW; }
+      if(h > maxH){ w = w*(maxH/h); h = maxH; }
+      canvas.width = w; canvas.height = h;
+      canvas.getContext('2d').drawImage(img,0,0,w,h);
+      const compressed = canvas.toDataURL('image/jpeg', 0.75);
+      S.ideas[i].img = compressed;
+      // حفظ في IndexedDB
+      saveImg('idea_'+i, compressed).then(()=>{
+        renderIdeasEditor();
+        renderIdeas();
+        showToast('✅ تم حفظ الصورة!');
+      });
+    };
+    img.src = e.target.result;
   };
   reader.readAsDataURL(file);
+}
+
+function deleteIdeaImg(i){
+  S.ideas[i].img = '';
+  deleteImg('idea_'+i).then(()=>{
+    renderIdeasEditor();
+    renderIdeas();
+    showToast('🗑 تم حذف الصورة');
+  });
+}
+  let t = document.getElementById('toast');
+  if(!t){
+    t = document.createElement('div');
+    t.id = 'toast';
+    t.style.cssText = 'position:fixed;bottom:2rem;left:50%;transform:translateX(-50%);background:var(--gold);color:var(--black);padding:0.7rem 1.5rem;border-radius:10px;font-weight:700;font-size:0.9rem;z-index:9999;transition:opacity 0.4s;font-family:Cairo,sans-serif;';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.opacity = '1';
+  clearTimeout(t._timer);
+  t._timer = setTimeout(()=>{ t.style.opacity='0'; }, 2500);
 }
 
 function toggleIdea(i){ S.ideas[i].visible=!S.ideas[i].visible; renderIdeasEditor(); }
@@ -843,7 +945,7 @@ function addIdeaCard(){
   S.ideas.push({ title:'فكرة جديدة', link:'#', emoji:'🎬', accent:'جديدة', bg:'#111', visible:true });
   renderIdeasEditor();
 }
-function saveIdeas(){ saveState(); renderIdeas(); alert('✅ تم حفظ الأفكار!'); }
+function saveIdeas(){ saveState(); renderIdeas(); showToast('✅ تم حفظ الأفكار!'); }
 
 // ADS EDITOR
 function renderAdsEditor(){
@@ -873,7 +975,7 @@ function addAdCard(){
   S.ads.push({ brand:'اسم العلامة', headline:'العنوان\n<gold>الذهبي</gold>', desc:'وصف الإعلان هنا', visible:true });
   renderAdsEditor();
 }
-function saveAds(){ saveState(); renderAds(); alert('✅ تم حفظ الإعلانات!'); }
+function saveAds(){ saveState(); renderAds(); showToast('✅ تم حفظ الإعلانات!'); }
 
 // WRITING EDITOR
 function renderWritingEditor(){
@@ -906,7 +1008,7 @@ function addWritingCard(){
   S.writing.push({ type:'نوع العمل', title:'عنوان جديد', desc:'وصف مختصر', excerpt:'النص هنا...', visible:true });
   renderWritingEditor();
 }
-function saveWriting(){ saveState(); renderWriting(); alert('✅ تم حفظ النصوص!'); }
+function saveWriting(){ saveState(); renderWriting(); showToast('✅ تم حفظ النصوص!'); }
 
 // SECTIONS MANAGER
 function renderSectionsManager(){
@@ -934,7 +1036,7 @@ function saveSections(){
     const el = document.getElementById('sec-edit-'+k);
     if(el) S.sections[k].title = el.value;
   });
-  saveState(); applySectionsDOM(); alert('✅ تم حفظ الأقسام!');
+  saveState(); applySectionsDOM(); showToast('✅ تم حفظ الأقسام!');
 }
 
 // VISITORS
